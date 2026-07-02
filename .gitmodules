@@ -1,6 +1,8 @@
 [submodule "submodules/kicad-sch-api"]
 	path = submodules/kicad-sch-api
-	url = https://github.com/circuit-synth/kicad-sch-api.git
+	url = https://github.com/freudenthal/kicad-sch-api.git
+	branch = main
 [submodule "submodules/circuit-synth"]
 	path = submodules/circuit-synth
-	url = git@github.com:circuit-synth/circuit-synth.git
+	url = https://github.com/freudenthal/circuit-synth.git
+	branch = main
