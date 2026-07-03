@@ -4,7 +4,9 @@ Standard MCP server providing KiCAD schematic manipulation tools.
 """
 
 import asyncio
+import re
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import logging
 
@@ -30,6 +32,59 @@ logger = logging.getLogger(__name__)
 
 # Global schematic instance
 current_schematic: Optional[Any] = None
+
+# --- Component search over KiCAD symbol libraries -----------------------------
+# kicad-sch-api's SQLite search index (discovery.search_index) cannot be built:
+# SymbolLibraryCache._load_library is an unimplemented stub, so bulk symbol
+# enumeration returns nothing. Instead we scan the .kicad_sym files the cache
+# already discovered, mirroring circuit-synth's tools/find_symbol.py. Top-level
+# symbols are indented one tab; deeper (sub-unit) symbols are naturally excluded.
+_TOPSYM_RE = re.compile(r'^\t\(symbol "([^"]+)"', re.MULTILINE)
+_DESC_RE = re.compile(r'\(property "(?:Description|ki_description)" "([^"]*)"')
+_KEYW_RE = re.compile(r'\(property "ki_keywords" "([^"]*)"')
+
+
+def _search_symbol_libraries(
+    query: str, library: Optional[str] = None, limit: int = 20
+) -> List[str]:
+    """Case-insensitive substring search over discovered KiCAD symbol libraries.
+
+    Matches the query against ``Lib:Symbol`` ids plus each symbol's description
+    and keywords. Returns a sorted list of ``Lib:Symbol`` ids (capped at limit).
+    """
+    try:
+        from kicad_sch_api.library.cache import get_symbol_cache
+
+        cache = get_symbol_cache()
+        lib_index = dict(getattr(cache, "_library_index", {}) or {})
+    except Exception as e:  # cache/library unavailable
+        logger.warning(f"search_components: symbol cache unavailable: {e}")
+        return []
+
+    q = query.lower()
+    hits = set()
+    for lib_name, lib_path in sorted(lib_index.items()):
+        if library and lib_name.lower() != library.lower():
+            continue
+        try:
+            text = Path(lib_path).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        marks = list(_TOPSYM_RE.finditer(text))
+        for i, m in enumerate(marks):
+            sym_name = m.group(1)
+            end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+            block = text[m.end() : end]  # this symbol's body (incl. properties)
+            desc = _DESC_RE.search(block)
+            keyw = _KEYW_RE.search(block)
+            haystack = (
+                f"{lib_name}:{sym_name} "
+                f"{desc.group(1) if desc else ''} "
+                f"{keyw.group(1) if keyw else ''}"
+            ).lower()
+            if q in haystack:
+                hits.add(f"{lib_name}:{sym_name}")
+    return sorted(hits)[:limit]
 
 
 async def main():
@@ -531,35 +586,22 @@ async def main():
                     )]
                     
                 library = arguments.get("library")
-                limit = arguments.get("limit", 20)
-                
+                limit = arguments.get("limit") or 20
+
                 logger.info(f"Searching components: {query}")
-                
-                try:
-                    # Use the kicad-sch-api search functionality
-                    from kicad_sch_api.discovery.search_index import search_components as search_func
-                    
-                    results = search_func(query, library=library, limit=limit)
-                    
-                    if not results:
-                        return [TextContent(
-                            type="text",
-                            text=f"No components found matching '{query}'"
-                        )]
-                    
-                    result_text = f"Found {len(results)} components matching '{query}':\n\n"
-                    for result in results[:limit]:
-                        result_text += f"• {result.get('lib_id', 'Unknown')}"
-                        if 'description' in result:
-                            result_text += f" - {result['description']}"
-                        result_text += "\n"
-                    
-                    return [TextContent(type="text", text=result_text)]
-                except ImportError:
+
+                results = _search_symbol_libraries(query, library=library, limit=limit)
+
+                if not results:
+                    scope = f" in library '{library}'" if library else ""
                     return [TextContent(
                         type="text",
-                        text="❌ Component search functionality not available"
+                        text=f"No components found matching '{query}'{scope}."
                     )]
+
+                header = f"Found {len(results)} component(s) matching '{query}':\n\n"
+                body = "\n".join(f"• {lib_id}" for lib_id in results)
+                return [TextContent(type="text", text=header + body)]
                 
             elif name == "add_wire":
                 if current_schematic is None:
