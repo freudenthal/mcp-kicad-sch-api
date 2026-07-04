@@ -4,8 +4,10 @@ Standard MCP server providing KiCAD schematic manipulation tools.
 """
 
 import asyncio
+import os
 import re
 import sys
+import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import logging
@@ -29,6 +31,35 @@ logging.basicConfig(
     stream=sys.stderr
 )
 logger = logging.getLogger(__name__)
+
+
+def _dist_version(dist_name: str) -> str:
+    """Best-effort installed version of a distribution (never raises)."""
+    try:
+        from importlib.metadata import version
+
+        return version(dist_name)
+    except Exception:
+        return "unknown"
+
+
+def _log_startup_banner() -> None:
+    """Record what this process is, to stderr, so a later silent death is
+    diagnosable from the client log (which otherwise only shows 'transport
+    closed unexpectedly' with no Python context)."""
+    ksa_version = getattr(ksa, "__version__", None) or _dist_version("kicad-sch-api")
+    logger.info(
+        "kicad-sch-api MCP server starting | "
+        "server=%s kicad_sch_api=%s mcp=%s | "
+        "python=%s pid=%s cwd=%s",
+        _dist_version("mcp-kicad-sch-api"),
+        ksa_version,
+        _dist_version("mcp"),
+        sys.version.split()[0],
+        os.getpid(),
+        os.getcwd(),
+    )
+
 
 # Global schematic instance
 current_schematic: Optional[Any] = None
@@ -89,8 +120,9 @@ def _search_symbol_libraries(
 
 async def main():
     """Main MCP server entry point."""
+    _log_startup_banner()
     logger.info("Starting MCP KiCAD Schematic API Server...")
-    
+
     server = Server("mcp-kicad-sch-api")
     
     @server.list_tools()
@@ -1416,15 +1448,30 @@ async def main():
     
     # Start the MCP server
     logger.info("MCP server ready, waiting for connections...")
-    
+
     options = server.create_initialization_options()
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            options,
-            raise_exceptions=True
-        )
+    exit_reason = "clean shutdown (client closed the transport)"
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(
+                read_stream,
+                write_stream,
+                options,
+                raise_exceptions=True,
+            )
+    except (KeyboardInterrupt, asyncio.CancelledError) as e:
+        exit_reason = f"interrupted ({type(e).__name__})"
+        raise
+    except BaseException as e:
+        # Make an otherwise-silent death explain itself: without this, the client
+        # log only shows "transport closed unexpectedly" with no Python context.
+        exit_reason = f"unhandled {type(e).__name__}: {e}"
+        logger.error("MCP server exiting on unhandled exception: %s", e)
+        traceback.print_exc(file=sys.stderr)
+        raise
+    finally:
+        # Always leave a breadcrumb, whatever the exit path.
+        logger.info("MCP server run loop exited: %s", exit_reason)
 
 
 if __name__ == "__main__":
